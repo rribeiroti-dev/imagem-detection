@@ -1,77 +1,88 @@
 import streamlit as st
+import cv2
 import numpy as np
-from PIL import Image
 from ultralytics import YOLO
+import easyocr
+import re
+import ssl
 
-# Layout mais largo para acomodar o menu lateral
-st.set_page_config(page_title="YOLOv8 Avançado", layout="wide")
+# ==========================================
+# FIX SSL
+# ==========================================
+try:
+    _create_unverified_https_context = ssl._create_unverified_context
+except AttributeError:
+    pass
+else:
+    ssl._create_default_https_context = _create_unverified_https_context
 
-st.title("👁️ Detecção Avançada com YOLOv8")
-st.write("Ajuste a inteligência e a visão do modelo no menu lateral.")
+# ==========================================
+# CONFIGURAÇÃO
+# ==========================================
+st.set_page_config(page_title="ALPR Alta Precisão", layout="centered")
 
-# ----------------- MENU LATERAL -----------------
-st.sidebar.header("⚙️ Parâmetros do Modelo")
-
-# 1. Tamanho do Modelo (Permite baixar modelos mais inteligentes)
-escolha_modelo = st.sidebar.selectbox(
-    "1. Inteligência da IA (Tamanho)",
-    [
-        "yolov8n.pt (Nano - Muito Rápido, Menos Preciso)", 
-        "yolov8s.pt (Small - Equilibrado)", 
-        "yolov8m.pt (Medium - Mais Lento na CPU, Muito Preciso)"
-    ]
-)
-arquivo_modelo = escolha_modelo.split(" ")[0] # Extrai apenas o "yolov8m.pt"
-
-# 2. Confiança
-confianca = st.sidebar.slider(
-    "2. Limite de Confiança (conf)", 
-    min_value=0.01, max_value=1.0, value=0.25, step=0.01,
-    help="Valores menores mostram mais objetos, mas podem gerar falsos positivos."
-)
-
-# 3. Resolução da Imagem (Lente de aumento)
-tamanho_img = st.sidebar.select_slider(
-    "3. Resolução de Inferência (imgsz)",
-    options=[640, 736, 800, 1024, 1280],
-    value=1024,
-    help="Aumente para 1024 ou 1280 para achar objetos minúsculos na pintura."
-)
-
-# ----------------- LÓGICA PRINCIPAL -----------------
-# Cache adaptável: recarrega apenas se o usuário mudar de Nano para Medium, por exemplo
 @st.cache_resource
-def load_model(nome_modelo):
-    return YOLO(nome_modelo)
+def load_models():
+    yolo = YOLO('yolov8n.pt')
+    reader = easyocr.Reader(['en'], gpu=False, verbose=False)
+    return yolo, reader
 
-model = load_model(arquivo_modelo)
+def preprocess(image_cv):
+    gray = cv2.cvtColor(image_cv, cv2.COLOR_BGR2GRAY)
+    # Reforço de contraste para placas em condições de rua
+    clahe = cv2.createCLAHE(clipLimit=2.5, tileGridSize=(8,8))
+    return clahe.apply(gray)
 
-uploaded_file = st.file_uploader("Escolha a imagem (JPG/PNG)", type=["jpg", "jpeg", "png"])
-
-if uploaded_file is not None:
-    # Tratamento de imagem robusto (forçando RGB para evitar erro de 4 canais)
-    image = Image.open(uploaded_file).convert("RGB")
-    img_array = np.array(image)
+def extract_best_plate(image_np, yolo_model, ocr_reader):
+    # Processa imagem inteira (mais robusto para ângulos e distâncias)
+    img_prep = preprocess(image_np)
+    results = ocr_reader.readtext(img_prep)
     
-    col1, col2 = st.columns(2)
-    
-    with col1:
-        st.image(image, caption="Imagem Original", use_column_width=True)
+    # Extrai todos os textos e suas confianças
+    candidates = []
+    for bbox, text, conf in results:
+        clean = re.sub(r'[^A-Z0-9]', '', text.upper())
+        if len(clean) >= 3:
+            candidates.append({'text': clean, 'conf': conf})
 
-    with col2:
-        if st.button("Detectar Objetos", type="primary"):
-            with st.spinner(f"Processando com {arquivo_modelo}..."):
+    # Tenta montar placas validando padrões 
+    # (Padrão Antigo: 3 letras + 4 números | Mercosul: 3 letras + 1 num + 1 let + 2 num)
+    pattern = re.compile(r'([A-Z]{3})([0-9][A-Z0-9][0-9]{2})')
+    
+    best_match = None
+    max_conf = 0
+    
+    # Busca padrões em todos os textos lidos
+    for cand in candidates:
+        match = pattern.search(cand['text'])
+        if match:
+            plate = f"{match.group(1)}-{match.group(2)}"
+            # Prioriza a leitura com maior confiança do OCR
+            if cand['conf'] > max_conf:
+                max_conf = cand['conf']
+                best_match = plate
                 
-                # A MÁGICA: Passamos a confiança e o tamanho da imagem para a IA!
-                results = model(img_array, conf=confianca, imgsz=tamanho_img)
-                
-                annotated_image = results[0].plot()
-                
-                st.image(annotated_image, caption="Resultado Avançado", use_column_width=True)
-                
-                total_objetos = len(results[0].boxes)
-                st.success(f"Encontrados {total_objetos} objeto(s).")
-                
-                if total_objetos > 0:
-                    nomes = [results[0].names[int(classe)] for classe in results[0].boxes.cls]
-                    st.write("**Classes identificadas:**", ", ".join(set(nomes)))
+    return best_match
+
+def main():
+    st.title("🚗 Leitor de Placas de Alta Tolerância")
+    yolo_model, ocr_reader = load_models()
+
+    uploaded_file = st.file_uploader("Upload da imagem", type=["jpg", "jpeg", "png"])
+    if uploaded_file:
+        file_bytes = np.asarray(bytearray(uploaded_file.read()), dtype=np.uint8)
+        image = cv2.imdecode(file_bytes, 1)
+        image_rgb = cv2.cvtColor(image, cv2.COLOR_BGR2RGB)
+        
+        st.image(image_rgb, use_column_width=True)
+        
+        with st.spinner("Analisando cena..."):
+            placa = extract_best_plate(image_rgb, yolo_model, ocr_reader)
+            
+            if placa:
+                st.success(f"### Placa Identificada: {placa}")
+            else:
+                st.error("Não foi possível detectar padrão de placa na imagem.")
+
+if __name__ == '__main__':
+    main()
